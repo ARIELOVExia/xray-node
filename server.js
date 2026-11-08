@@ -1,8 +1,11 @@
-// Ample runtime wrapper: downloads official xray-core at runtime, runs
-// VLESS+WS on an internal port, and serves the platform $PORT with a tiny
-// proxy that answers health checks (200 on /) and relays WebSocket
-// upgrades on WS_PATH to xray. No secrets are hard-coded: UUID and WS_PATH
-// arrive as encrypted env vars from the deploy call.
+// Runtime wrapper: downloads official xray-core at runtime, runs VLESS+XHTTP
+// (packet-up) on an internal port, and serves the platform $PORT with a tiny
+// proxy that answers health checks (200 on /), relays plain HTTP requests on
+// WS_PATH to xray (XHTTP), and relays WebSocket upgrades on WS_PATH to xray.
+// WS was tried first (2026-11-08): the AOZUMI/Cloudflare gateway hung every
+// WS upgrade with no 101 and no server-side trace, so XHTTP packet-up —
+// designed to pass through such gateways — is the transport now.
+// No secrets are hard-coded: UUID and WS_PATH arrive as env vars.
 const { spawn, execFile } = require('child_process');
 const fs = require('fs');
 const https = require('https');
@@ -85,7 +88,7 @@ async function main() {
       listen: '127.0.0.1',
       protocol: 'vless',
       settings: { clients: [{ id: UUID }], decryption: 'none' },
-      streamSettings: { network: 'ws', wsSettings: { path: WS_PATH } },
+      streamSettings: { network: 'xhttp', xhttpSettings: { path: WS_PATH, mode: 'packet-up' } },
     }],
     outbounds: [{ protocol: 'freedom', tag: 'direct' }],
   };
@@ -97,12 +100,35 @@ async function main() {
   xray.on('exit', (code) => { console.error('xray exited with code', code); process.exit(1); });
 
   const server = http.createServer((req, res) => {
+    if (req.url === WS_PATH) {
+      // XHTTP: forward the plain HTTP request (GET download stream / POST upload) to xray.
+      console.log('[xhttp] ' + req.method + ' ' + req.url);
+      const headers = { ...req.headers };
+      delete headers.host;
+      const upstream = http.request(
+        { host: '127.0.0.1', port: XRAY_PORT, path: req.url, method: req.method, headers },
+        (upRes) => {
+          console.log('[xhttp] upstream ' + upRes.statusCode + ' for ' + req.method + ' ' + req.url);
+          res.writeHead(upRes.statusCode, upRes.headers);
+          upRes.pipe(res);
+        }
+      );
+      upstream.on('error', (e) => {
+        console.log('[xhttp] upstream error: ' + e.message);
+        if (!res.headersSent) res.writeHead(502);
+        res.end();
+      });
+      req.pipe(upstream);
+      return;
+    }
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.end('ok');
   });
   server.on('upgrade', (req, socket, head) => {
-    if (req.url !== WS_PATH) { socket.destroy(); return; }
+    console.log('[ws] upgrade ' + req.url);
+    if (req.url !== WS_PATH) { console.log('[ws] path mismatch, destroy'); socket.destroy(); return; }
     const upstream = net.connect(XRAY_PORT, '127.0.0.1', () => {
+      console.log('[ws] upstream connected');
       const headers = `${req.method} ${req.url} HTTP/1.1\r\nHost: 127.0.0.1:${XRAY_PORT}\r\n` +
         Object.entries(req.headers).map(([k, v]) => `${k}: ${v}`).join('\r\n') + '\r\n\r\n';
       upstream.write(headers);
@@ -110,7 +136,7 @@ async function main() {
       socket.pipe(upstream);
       upstream.pipe(socket);
     });
-    upstream.on('error', () => socket.destroy());
+    upstream.on('error', (e) => { console.log('[ws] upstream error: ' + e.message); socket.destroy(); });
     socket.on('error', () => upstream.destroy());
   });
   server.listen(PORT, '0.0.0.0', () => console.log('proxy listening on 0.0.0.0:' + PORT + ' ws=' + WS_PATH));

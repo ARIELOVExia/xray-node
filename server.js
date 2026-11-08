@@ -100,7 +100,9 @@ async function main() {
   xray.on('exit', (code) => { console.error('xray exited with code', code); process.exit(1); });
 
   const server = http.createServer((req, res) => {
-    if (req.url === WS_PATH) {
+    // XHTTP clients request {WS_PATH}/{session-uuid} (and the upload POST
+    // uses the same pattern), so match by prefix, not exact path.
+    if (req.url === WS_PATH || req.url.startsWith(WS_PATH + '/')) {
       // XHTTP: forward the plain HTTP request (GET download stream / POST upload) to xray.
       console.log('[xhttp] ' + req.method + ' ' + req.url);
       const headers = { ...req.headers };
@@ -126,7 +128,7 @@ async function main() {
   });
   server.on('upgrade', (req, socket, head) => {
     console.log('[ws] upgrade ' + req.url);
-    if (req.url !== WS_PATH) { console.log('[ws] path mismatch, destroy'); socket.destroy(); return; }
+    if (!(req.url === WS_PATH || req.url.startsWith(WS_PATH + '/'))) { console.log('[ws] path mismatch, destroy'); socket.destroy(); return; }
     const upstream = net.connect(XRAY_PORT, '127.0.0.1', () => {
       console.log('[ws] upstream connected');
       const headers = `${req.method} ${req.url} HTTP/1.1\r\nHost: 127.0.0.1:${XRAY_PORT}\r\n` +

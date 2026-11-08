@@ -2,6 +2,11 @@
 // (packet-up) on an internal port, and serves the platform $PORT with a tiny
 // proxy that answers health checks (200 on /), relays plain HTTP requests on
 // WS_PATH to xray (XHTTP), and relays WebSocket upgrades on WS_PATH to xray.
+// It also serves GET /sub: the base64 subscription (one vless:// line) built
+// at runtime from the same env vars, so the node can be added as a
+// subscription in a client. /sub is public on the app link — anyone with the
+// link can fetch the node credentials, which is the accepted trade-off for
+// the temporary subscription until the user's own domain is ready.
 // WS was tried first (2026-11-08): the AOZUMI/Cloudflare gateway hung every
 // WS upgrade with no 101 and no server-side trace, so XHTTP packet-up —
 // designed to pass through such gateways — is the transport now.
@@ -100,6 +105,18 @@ async function main() {
   xray.on('exit', (code) => { console.error('xray exited with code', code); process.exit(1); });
 
   const server = http.createServer((req, res) => {
+    // Temporary subscription endpoint: base64 of the vless:// node link,
+    // built at runtime from env so it always matches the running config.
+    if (req.url === '/sub') {
+      const link = 'vless://' + UUID + '@xray.aozumi.site:443' +
+        '?encryption=none&security=tls&sni=xray.aozumi.site&fp=chrome' +
+        '&type=xhttp&path=' + encodeURIComponent(WS_PATH) + '&mode=packet-up' +
+        '#AOZUMI-XHTTP';
+      const b64 = Buffer.from(link + '\n').toString('base64');
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+      res.end(b64 + '\n');
+      return;
+    }
     // XHTTP clients request {WS_PATH}/{session-uuid} (and the upload POST
     // uses the same pattern), so match by prefix, not exact path.
     if (req.url === WS_PATH || req.url.startsWith(WS_PATH + '/')) {
